@@ -19,6 +19,7 @@ A high-performance Web3 RPC proxy server built with Bun that provides round-robi
 - 🔀 Per-endpoint concurrent request limiting
 - ❤️ Automatic unhealthy endpoint detection and recovery
 - 📊 Detailed endpoint performance metrics
+- 🔁 Smart retry logic with up to 2 additional endpoints on failure
 
 ## Installation
 
@@ -45,6 +46,8 @@ Configure the server using environment variables:
 - `MAX_CONCURRENT_REQUESTS`: Max concurrent requests per endpoint (default: 200)
 - `ENABLE_CACHE`: Enable response caching for identical requests (default: false)
 - `CACHE_TTL`: Cache time-to-live in milliseconds (default: 1000 = 1s)
+- `DEBUG`: Enable debug mode for verbose logging (default: false)
+- `MAX_RETRY_ATTEMPTS`: Maximum additional RPC attempts on failure (default: 2)
 
 Example `.env` file:
 ```bash
@@ -56,6 +59,8 @@ REQUEST_TIMEOUT=6000      # 6 seconds
 MAX_CONCURRENT_REQUESTS=200
 ENABLE_CACHE=true
 CACHE_TTL=1000           # 1 second
+DEBUG=false              # Set to true for verbose logging
+MAX_RETRY_ATTEMPTS=2     # Try up to 2 additional endpoints on failure
 ```
 
 ## Usage
@@ -88,6 +93,9 @@ Run a 20-second stress test at 50 RPS to verify performance:
 ```bash
 # Test against custom proxy URL
 PROXY_URL=http://localhost:8080/rpc bun stress-test
+
+# Test with custom RPS target
+TARGET_RPS=70 bun stress-test
 ```
 
 ## API Endpoints
@@ -223,7 +231,8 @@ The server also logs unhealthy endpoints every 30 seconds for operational awaren
 
 The included stress test tool (`stress-test.ts`) simulates realistic load patterns:
 
-- Generates 50 requests per second for 20 seconds
+- Generates target RPS using multiple concurrent request streams
+- Default 50 RPS for 20 seconds (configurable via TARGET_RPS env var)
 - Uses weighted distribution of common RPC methods
 - Tracks response times and success rates
 - Provides detailed performance metrics including percentiles

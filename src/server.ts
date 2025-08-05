@@ -4,11 +4,11 @@ import type { JSONRPCRequest, JSONRPCResponse, RequestStats } from "./types";
 // Configuration
 const PORT = parseInt(process.env.PORT || "3000");
 const RPC_URLS = process.env.RPC_URLS?.split(",") || [
-  "https://arbitrum-one-rpc.publicnode.com",
-  "https://arb1.lava.build",
-  "https://arbitrum.drpc.org",
-  "https://1rpc.io/arb",
-  "https://arb-pokt.nodies.app"
+  //"https://arbitrum-one-rpc.publicnode.com",
+  //"https://arb1.lava.build",
+  //"https://arbitrum.drpc.org",
+  //"https://1rpc.io/arb",
+  //"https://arbitrum-one-public.nodies.app",
 ];
 
 // CORS configuration
@@ -18,6 +18,8 @@ const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || "6000"); // 6s d
 const MAX_CONCURRENT_REQUESTS = parseInt(process.env.MAX_CONCURRENT_REQUESTS || "200"); // Per endpoint
 const ENABLE_CACHE = process.env.ENABLE_CACHE === "true";
 const CACHE_TTL = parseInt(process.env.CACHE_TTL || "1000"); // 1 second cache for identical requests
+const DEBUG = process.env.DEBUG === "true"; // Debug mode for verbose logging
+const MAX_RETRY_ATTEMPTS = parseInt(process.env.MAX_RETRY_ATTEMPTS || "2"); // Max additional RPC attempts on failure
 
 // Atomic counter for round-robin rotation
 let currentIndex = 0;
@@ -72,12 +74,6 @@ interface CacheEntry {
 }
 const requestCache = new Map<string, CacheEntry>();
 
-// Get next RPC URL using atomic operation
-function getNextRpcUrl(): string {
-  const index = Atomics.add(new Int32Array(new SharedArrayBuffer(4)), 0, 1) % RPC_URLS.length;
-  return RPC_URLS[index];
-}
-
 // Simple round-robin without atomics (Bun is single-threaded by default)
 function getNextRpcUrlSimple(): string {
   let attempts = 0;
@@ -104,6 +100,31 @@ function getNextRpcUrlSimple(): string {
   }
   
   return bestUrl;
+}
+
+// Get alternative RPC URLs for retry (doesn't affect global round-robin)
+function getRetryRpcUrls(failedUrl: string, maxRetries: number): string[] {
+  const retryUrls: string[] = [];
+  const startIdx = RPC_URLS.indexOf(failedUrl);
+  if (startIdx === -1) return retryUrls;
+  
+  let attempts = 0;
+  let idx = (startIdx + 1) % RPC_URLS.length;
+  
+  while (retryUrls.length < maxRetries && attempts < RPC_URLS.length) {
+    const url = RPC_URLS[idx];
+    const health = endpointHealth.get(url);
+    
+    // Only use healthy endpoints with capacity for retries
+    if (url !== failedUrl && health && health.isHealthy && health.activeRequests < MAX_CONCURRENT_REQUESTS) {
+      retryUrls.push(url);
+    }
+    
+    idx = (idx + 1) % RPC_URLS.length;
+    attempts++;
+  }
+  
+  return retryUrls;
 }
 
 // Generate CORS headers based on request origin
@@ -143,7 +164,7 @@ function updateEndpointHealth(url: string, success: boolean, responseTime?: numb
     // Mark as healthy if it was unhealthy
     if (!health.isHealthy) {
       health.isHealthy = true;
-      console.log(`✅ Endpoint ${url} is now healthy`);
+      if (DEBUG) console.log(`✅ Endpoint ${url} is now healthy`);
     }
   } else {
     health.totalFailures++;
@@ -153,7 +174,7 @@ function updateEndpointHealth(url: string, success: boolean, responseTime?: numb
     // Mark as unhealthy after 3 consecutive failures
     if (health.consecutiveFailures >= 3 && health.isHealthy) {
       health.isHealthy = false;
-      console.log(`❌ Endpoint ${url} marked as unhealthy after ${health.consecutiveFailures} failures`);
+      console.error(`❌ Endpoint ${url} marked as unhealthy after ${health.consecutiveFailures} failures`);
     }
   }
 }
@@ -193,6 +214,43 @@ function updateRPS() {
   // Calculate average RPS over the last few seconds
   const totalRequests = requestCounts.reduce((sum, count) => sum + count, 0);
   stats.requestsPerSecond = totalRequests / Math.max(1, requestCounts.length);
+}
+
+// Proxy request with retry logic
+async function proxyRequestWithRetry(request: JSONRPCRequest): Promise<JSONRPCResponse> {
+  const primaryUrl = getNextRpcUrlSimple();
+  let lastError: JSONRPCResponse | null = null;
+  
+  // Try primary endpoint
+  const primaryResult = await proxyRequest(request, primaryUrl);
+  if (!primaryResult.error) {
+    return primaryResult;
+  }
+  
+  lastError = primaryResult;
+  
+  // If primary fails and retries are enabled, try alternative endpoints
+  if (MAX_RETRY_ATTEMPTS > 0) {
+    const retryUrls = getRetryRpcUrls(primaryUrl, MAX_RETRY_ATTEMPTS);
+    
+    if (DEBUG && retryUrls.length > 0) {
+      console.log(`[RETRY] Primary endpoint ${primaryUrl} failed, trying ${retryUrls.length} alternatives`);
+    }
+    
+    for (const retryUrl of retryUrls) {
+      const retryResult = await proxyRequest(request, retryUrl);
+      if (!retryResult.error) {
+        if (DEBUG) {
+          console.log(`[RETRY] Success with ${retryUrl}`);
+        }
+        return retryResult;
+      }
+      lastError = retryResult;
+    }
+  }
+  
+  // All attempts failed, return last error
+  return lastError;
 }
 
 // Proxy JSON-RPC request to selected endpoint
@@ -237,7 +295,9 @@ async function proxyRequest(request: JSONRPCRequest, rpcUrl: string): Promise<JS
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
     const isTimeout = error instanceof Error && error.name === "AbortError";
-    console.error(`[ERROR] RPC request failed for ${rpcUrl}:`, errorMessage);
+    if (DEBUG || isTimeout) {
+      console.error(`[ERROR] RPC request failed for ${rpcUrl}:`, errorMessage);
+    }
     
     // Update health metrics on failure
     updateEndpointHealth(rpcUrl, false);
@@ -372,17 +432,15 @@ const server = serve({
           const cached = requestCache.get(cacheKey);
           if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
             response = { ...cached.response, id: body.id };
-            console.log(`[${new Date().toISOString()}] Cache hit for ${body.method}`);
+            if (DEBUG) console.log(`[${new Date().toISOString()}] Cache hit for ${body.method}`);
           } else {
             // Clean old cache entries periodically
             if (requestCache.size > 1000) {
               cleanCache();
             }
             
-            // Get next RPC URL and proxy request
-            const rpcUrl = getNextRpcUrlSimple();
-            console.log(`[${new Date().toISOString()}] Proxying ${body.method} to ${rpcUrl}`);
-            response = await proxyRequest(body, rpcUrl);
+            // Proxy request with retry logic
+            response = await proxyRequestWithRetry(body);
             
             // Cache successful responses
             if (!response.error && ENABLE_CACHE) {
@@ -393,10 +451,8 @@ const server = serve({
             }
           }
         } else {
-          // Get next RPC URL and proxy request
-          const rpcUrl = getNextRpcUrlSimple();
-          console.log(`[${new Date().toISOString()}] Proxying ${body.method} to ${rpcUrl}`);
-          response = await proxyRequest(body, rpcUrl);
+          // Proxy request with retry logic
+          response = await proxyRequestWithRetry(body);
         }
         
         // Update statistics
@@ -418,7 +474,7 @@ const server = serve({
         stats.failedRequests++;
         const errorMessage = error instanceof Error ? error.message : "Unknown error";
         stats.lastError = errorMessage;
-        console.error("[ERROR] Request processing failed:", errorMessage);
+        if (DEBUG) console.error("[ERROR] Request processing failed:", errorMessage);
         
         const headers = new Headers(corsHeaders);
         headers.set("Content-Type", "application/json");
@@ -466,11 +522,15 @@ const server = serve({
 console.log(`🚀 Web3 RPC Proxy Server running on http://localhost:${PORT}`);
 console.log(`📡 Configured with ${RPC_URLS.length} RPC endpoints`);
 console.log(`🔄 Using intelligent round-robin with health tracking`);
-console.log(`🔒 CORS enabled for origins: ${CORS_ORIGINS.join(", ")}`);
-console.log(`📏 Max request size: ${(MAX_REQUEST_SIZE / 1024 / 1024).toFixed(2)}MB`);
-console.log(`⏱️  Request timeout: ${REQUEST_TIMEOUT / 1000}s`);
-console.log(`🔀 Max concurrent requests per endpoint: ${MAX_CONCURRENT_REQUESTS}`);
-console.log(`💾 Response caching: ${ENABLE_CACHE ? `Enabled (TTL: ${CACHE_TTL}ms)` : 'Disabled'}`);
+console.log(`🔁 Retry on failure: ${MAX_RETRY_ATTEMPTS > 0 ? `Enabled (max ${MAX_RETRY_ATTEMPTS} retries)` : 'Disabled'}`);
+console.log(`🐛 Debug mode: ${DEBUG ? 'Enabled' : 'Disabled'}`);
+if (DEBUG) {
+  console.log(`🔒 CORS enabled for origins: ${CORS_ORIGINS.join(", ")}`);
+  console.log(`📏 Max request size: ${(MAX_REQUEST_SIZE / 1024 / 1024).toFixed(2)}MB`);
+  console.log(`⏱️  Request timeout: ${REQUEST_TIMEOUT / 1000}s`);
+  console.log(`🔀 Max concurrent requests per endpoint: ${MAX_CONCURRENT_REQUESTS}`);
+  console.log(`💾 Response caching: ${ENABLE_CACHE ? `Enabled (TTL: ${CACHE_TTL}ms)` : 'Disabled'}`);
+}
 console.log(`\n📊 Health check available at: http://localhost:${PORT}/health`);
 console.log(`🌐 RPC endpoint: http://localhost:${PORT}/rpc`);
 

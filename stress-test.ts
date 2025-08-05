@@ -11,8 +11,10 @@ interface TestResult {
 // Test configuration
 const PROXY_URL = process.env.PROXY_URL || "http://localhost:3000/rpc";
 const TEST_DURATION = 20000; // 20 seconds
-const TARGET_RPS = 50; // Target requests per second (middle of 30-70 range)
-const REQUEST_INTERVAL = 1000 / TARGET_RPS; // Milliseconds between requests
+const TARGET_RPS = parseInt(process.env.TARGET_RPS || "50"); // Target requests per second
+const CONCURRENT_STREAMS = 5; // Number of concurrent request streams
+const REQUESTS_PER_STREAM = TARGET_RPS / CONCURRENT_STREAMS;
+const REQUEST_INTERVAL = 1000 / REQUESTS_PER_STREAM; // Milliseconds between requests per stream
 
 // Common RPC methods to test
 const TEST_METHODS = [
@@ -99,22 +101,13 @@ async function makeRequest(method: string, params: any[]): Promise<TestResult> {
   }
 }
 
-// Generate random requests
-async function runStressTest() {
-  console.log(`🚀 Starting stress test...`);
-  console.log(`📊 Target: ${TARGET_RPS} RPS for ${TEST_DURATION / 1000} seconds`);
-  console.log(`🌐 Proxy URL: ${PROXY_URL}`);
-  console.log(`\n⏳ Running test...\n`);
-  
-  startTime = Date.now();
+// Single request stream
+async function runRequestStream(streamId: number) {
   const endTime = startTime + TEST_DURATION;
+  let requestsInStream = 0;
   
-  // Schedule requests at regular intervals
-  const interval = setInterval(async () => {
-    if (Date.now() >= endTime) {
-      clearInterval(interval);
-      return;
-    }
+  while (Date.now() < endTime) {
+    const loopStart = Date.now();
     
     // Select random method
     const { method, params } = weightedMethods[Math.floor(Math.random() * weightedMethods.length)];
@@ -130,10 +123,46 @@ async function runStressTest() {
         console.log(`Progress: ${results.length} requests, ${currentRPS.toFixed(1)} RPS`);
       }
     });
-  }, REQUEST_INTERVAL);
+    
+    requestsInStream++;
+    
+    // Calculate time to wait before next request
+    const elapsedTime = Date.now() - loopStart;
+    const waitTime = Math.max(0, REQUEST_INTERVAL - elapsedTime);
+    
+    if (waitTime > 0) {
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+    }
+  }
   
-  // Wait for test to complete
-  await new Promise(resolve => setTimeout(resolve, TEST_DURATION + 5000)); // Extra 5s for pending requests
+  return requestsInStream;
+}
+
+// Generate random requests
+async function runStressTest() {
+  console.log(`🚀 Starting stress test...`);
+  console.log(`📊 Target: ${TARGET_RPS} RPS for ${TEST_DURATION / 1000} seconds`);
+  console.log(`🔀 Using ${CONCURRENT_STREAMS} concurrent streams`);
+  console.log(`🌐 Proxy URL: ${PROXY_URL}`);
+  console.log(`\n⏳ Running test...\n`);
+  
+  startTime = Date.now();
+  
+  // Start multiple concurrent request streams
+  const streamPromises: Promise<number>[] = [];
+  for (let i = 0; i < CONCURRENT_STREAMS; i++) {
+    streamPromises.push(runRequestStream(i));
+  }
+  
+  // Wait for all streams to complete
+  const streamResults = await Promise.all(streamPromises);
+  const totalScheduled = streamResults.reduce((sum, count) => sum + count, 0);
+  
+  console.log(`\n⏹️  Scheduled ${totalScheduled} requests across ${CONCURRENT_STREAMS} streams`);
+  
+  // Wait for pending requests to complete
+  console.log(`⏳ Waiting for pending requests to complete...`);
+  await new Promise(resolve => setTimeout(resolve, 5000)); // Extra 5s for pending requests
   
   // Calculate statistics
   printResults();
