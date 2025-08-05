@@ -1,0 +1,20 @@
+{
+  "name": "web3-rpc-proxy",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "High-performance Web3 RPC proxy server with round-robin load balancing",
+  "main": "src/server.ts",
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "dev": "bun --watch run src/server.ts",
+    "build": "bun build src/server.ts --compile --outfile=web3-rpc-proxy",
+    "test": "bun test",
+    "stress-test": "bun run stress-test.ts"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "author": "",
+  "license": "MIT"
+}

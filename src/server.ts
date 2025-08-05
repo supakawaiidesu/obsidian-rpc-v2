@@ -1,0 +1,495 @@
+import { serve } from "bun";
+import type { JSONRPCRequest, JSONRPCResponse, RequestStats } from "./types";
+
+// Configuration
+const PORT = parseInt(process.env.PORT || "3000");
+const RPC_URLS = process.env.RPC_URLS?.split(",") || [
+  "https://arbitrum-one-rpc.publicnode.com",
+  "https://arb1.lava.build",
+  "https://arbitrum.drpc.org",
+  "https://1rpc.io/arb",
+  "https://arb-pokt.nodies.app"
+];
+
+// CORS configuration
+const CORS_ORIGINS = process.env.CORS_ORIGINS?.split(",") || ["*"];
+const MAX_REQUEST_SIZE = parseInt(process.env.MAX_REQUEST_SIZE || "1048576"); // 1MB default
+const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT || "6000"); // 6s default (5s max + buffer)
+const MAX_CONCURRENT_REQUESTS = parseInt(process.env.MAX_CONCURRENT_REQUESTS || "200"); // Per endpoint
+const ENABLE_CACHE = process.env.ENABLE_CACHE === "true";
+const CACHE_TTL = parseInt(process.env.CACHE_TTL || "1000"); // 1 second cache for identical requests
+
+// Atomic counter for round-robin rotation
+let currentIndex = 0;
+const startTime = Date.now();
+
+// Request statistics
+const stats: RequestStats = {
+  totalRequests: 0,
+  successfulRequests: 0,
+  failedRequests: 0,
+  uptime: 0,
+  requestsPerSecond: 0
+};
+
+// Request tracking for RPS calculation
+let requestCounts: number[] = [];
+let lastSecond = Math.floor(Date.now() / 1000);
+
+// Endpoint health tracking
+interface EndpointHealth {
+  url: string;
+  isHealthy: boolean;
+  consecutiveFailures: number;
+  lastFailure?: Date;
+  activeRequests: number;
+  totalRequests: number;
+  totalFailures: number;
+  averageResponseTime: number;
+  responseTimeSamples: number[];
+}
+
+const endpointHealth: Map<string, EndpointHealth> = new Map();
+
+// Initialize endpoint health
+RPC_URLS.forEach(url => {
+  endpointHealth.set(url, {
+    url,
+    isHealthy: true,
+    consecutiveFailures: 0,
+    activeRequests: 0,
+    totalRequests: 0,
+    totalFailures: 0,
+    averageResponseTime: 0,
+    responseTimeSamples: []
+  });
+});
+
+// Simple request cache
+interface CacheEntry {
+  response: JSONRPCResponse;
+  timestamp: number;
+}
+const requestCache = new Map<string, CacheEntry>();
+
+// Get next RPC URL using atomic operation
+function getNextRpcUrl(): string {
+  const index = Atomics.add(new Int32Array(new SharedArrayBuffer(4)), 0, 1) % RPC_URLS.length;
+  return RPC_URLS[index];
+}
+
+// Simple round-robin without atomics (Bun is single-threaded by default)
+function getNextRpcUrlSimple(): string {
+  let attempts = 0;
+  while (attempts < RPC_URLS.length) {
+    const url = RPC_URLS[currentIndex];
+    currentIndex = (currentIndex + 1) % RPC_URLS.length;
+    
+    const health = endpointHealth.get(url);
+    if (health && health.isHealthy && health.activeRequests < MAX_CONCURRENT_REQUESTS) {
+      return url;
+    }
+    attempts++;
+  }
+  
+  // If all endpoints are unhealthy or at capacity, return the least loaded one
+  let bestUrl = RPC_URLS[0];
+  let lowestActiveRequests = Infinity;
+  
+  for (const [url, health] of endpointHealth) {
+    if (health.activeRequests < lowestActiveRequests) {
+      lowestActiveRequests = health.activeRequests;
+      bestUrl = url;
+    }
+  }
+  
+  return bestUrl;
+}
+
+// Generate CORS headers based on request origin
+function getCORSHeaders(req: Request): Headers {
+  const headers = new Headers();
+  const origin = req.headers.get("origin");
+  
+  // Check if origin is allowed
+  if (CORS_ORIGINS.includes("*") || (origin && CORS_ORIGINS.includes(origin))) {
+    headers.set("Access-Control-Allow-Origin", origin || "*");
+    headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    headers.set("Access-Control-Max-Age", "86400"); // 24 hours
+  }
+  
+  return headers;
+}
+
+// Update endpoint health based on request outcome
+function updateEndpointHealth(url: string, success: boolean, responseTime?: number) {
+  const health = endpointHealth.get(url);
+  if (!health) return;
+  
+  health.totalRequests++;
+  
+  if (success) {
+    health.consecutiveFailures = 0;
+    if (responseTime !== undefined) {
+      health.responseTimeSamples.push(responseTime);
+      // Keep only last 100 samples
+      if (health.responseTimeSamples.length > 100) {
+        health.responseTimeSamples.shift();
+      }
+      health.averageResponseTime = health.responseTimeSamples.reduce((a, b) => a + b, 0) / health.responseTimeSamples.length;
+    }
+    
+    // Mark as healthy if it was unhealthy
+    if (!health.isHealthy) {
+      health.isHealthy = true;
+      console.log(`✅ Endpoint ${url} is now healthy`);
+    }
+  } else {
+    health.totalFailures++;
+    health.consecutiveFailures++;
+    health.lastFailure = new Date();
+    
+    // Mark as unhealthy after 3 consecutive failures
+    if (health.consecutiveFailures >= 3 && health.isHealthy) {
+      health.isHealthy = false;
+      console.log(`❌ Endpoint ${url} marked as unhealthy after ${health.consecutiveFailures} failures`);
+    }
+  }
+}
+
+// Generate cache key for request
+function getCacheKey(request: JSONRPCRequest): string {
+  return `${request.method}:${JSON.stringify(request.params || [])}`;
+}
+
+// Clean old cache entries
+function cleanCache() {
+  const now = Date.now();
+  for (const [key, entry] of requestCache) {
+    if (now - entry.timestamp > CACHE_TTL) {
+      requestCache.delete(key);
+    }
+  }
+}
+
+// Update request per second statistics
+function updateRPS() {
+  const currentSecond = Math.floor(Date.now() / 1000);
+  
+  if (currentSecond !== lastSecond) {
+    // Keep only last 10 seconds of data
+    if (requestCounts.length >= 10) {
+      requestCounts.shift();
+    }
+    requestCounts.push(0);
+    lastSecond = currentSecond;
+  }
+  
+  if (requestCounts.length > 0) {
+    requestCounts[requestCounts.length - 1]++;
+  }
+  
+  // Calculate average RPS over the last few seconds
+  const totalRequests = requestCounts.reduce((sum, count) => sum + count, 0);
+  stats.requestsPerSecond = totalRequests / Math.max(1, requestCounts.length);
+}
+
+// Proxy JSON-RPC request to selected endpoint
+async function proxyRequest(request: JSONRPCRequest, rpcUrl: string): Promise<JSONRPCResponse> {
+  const startTime = Date.now();
+  const health = endpointHealth.get(rpcUrl);
+  
+  if (health) {
+    health.activeRequests++;
+  }
+  
+  try {
+    // Create abort controller for timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+    
+    const response = await fetch(rpcUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "Web3-RPC-Proxy/1.0"
+      },
+      body: JSON.stringify(request),
+      signal: controller.signal,
+      // Bun automatically handles connection pooling
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const data = await response.json() as JSONRPCResponse;
+    
+    // Update health metrics on success
+    const responseTime = Date.now() - startTime;
+    updateEndpointHealth(rpcUrl, true, responseTime);
+    
+    return data;
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : "Unknown error";
+    const isTimeout = error instanceof Error && error.name === "AbortError";
+    console.error(`[ERROR] RPC request failed for ${rpcUrl}:`, errorMessage);
+    
+    // Update health metrics on failure
+    updateEndpointHealth(rpcUrl, false);
+    
+    return {
+      jsonrpc: "2.0",
+      error: {
+        code: isTimeout ? -32050 : -32603,
+        message: isTimeout ? "Request timeout" : "Internal error",
+        data: errorMessage
+      },
+      id: request.id
+    };
+  } finally {
+    if (health) {
+      health.activeRequests--;
+    }
+  }
+}
+
+// Main server
+const server = serve({
+  port: PORT,
+  async fetch(req) {
+    const url = new URL(req.url);
+    const corsHeaders = getCORSHeaders(req);
+    
+    // Handle CORS preflight requests
+    if (req.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders
+      });
+    }
+    
+    // Health check endpoint
+    if (url.pathname === "/health") {
+      stats.uptime = Date.now() - startTime;
+      const headers = new Headers(corsHeaders);
+      headers.set("Content-Type", "application/json");
+      
+      // Prepare endpoint health data
+      const endpoints = Array.from(endpointHealth.values()).map(health => ({
+        url: health.url,
+        isHealthy: health.isHealthy,
+        activeRequests: health.activeRequests,
+        totalRequests: health.totalRequests,
+        totalFailures: health.totalFailures,
+        failureRate: health.totalRequests > 0 ? (health.totalFailures / health.totalRequests * 100).toFixed(2) + '%' : '0%',
+        averageResponseTime: Math.round(health.averageResponseTime),
+        lastFailure: health.lastFailure
+      }));
+      
+      const healthyEndpoints = endpoints.filter(e => e.isHealthy).length;
+      const totalActiveRequests = endpoints.reduce((sum, e) => sum + e.activeRequests, 0);
+      
+      return new Response(JSON.stringify({
+        status: healthyEndpoints > 0 ? "healthy" : "degraded",
+        stats,
+        rpcUrls: RPC_URLS.length,
+        healthyEndpoints,
+        totalActiveRequests,
+        currentIndex,
+        endpoints,
+        cache: {
+          enabled: ENABLE_CACHE,
+          size: requestCache.size,
+          ttl: CACHE_TTL
+        },
+        config: {
+          maxConcurrentRequests: MAX_CONCURRENT_REQUESTS,
+          requestTimeout: REQUEST_TIMEOUT,
+          maxRequestSize: MAX_REQUEST_SIZE
+        }
+      }), {
+        headers
+      });
+    }
+    
+    // RPC proxy endpoint
+    if (url.pathname === "/rpc" && req.method === "POST") {
+      stats.totalRequests++;
+      updateRPS();
+      
+      try {
+        // Check request size
+        const contentLength = req.headers.get("content-length");
+        if (contentLength && parseInt(contentLength) > MAX_REQUEST_SIZE) {
+          stats.failedRequests++;
+          const headers = new Headers(corsHeaders);
+          headers.set("Content-Type", "application/json");
+          
+          return new Response(JSON.stringify({
+            jsonrpc: "2.0",
+            error: {
+              code: -32700,
+              message: "Request too large"
+            },
+            id: null
+          }), {
+            status: 413,
+            headers
+          });
+        }
+        
+        const body = await req.json() as JSONRPCRequest;
+        
+        // Validate JSON-RPC request
+        if (!body.jsonrpc || !body.method) {
+          stats.failedRequests++;
+          const headers = new Headers(corsHeaders);
+          headers.set("Content-Type", "application/json");
+          
+          return new Response(JSON.stringify({
+            jsonrpc: "2.0",
+            error: {
+              code: -32600,
+              message: "Invalid Request"
+            },
+            id: body.id || null
+          }), {
+            status: 400,
+            headers
+          });
+        }
+        
+        // Check cache if enabled
+        let response: JSONRPCResponse;
+        const cacheKey = getCacheKey(body);
+        
+        if (ENABLE_CACHE) {
+          const cached = requestCache.get(cacheKey);
+          if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+            response = { ...cached.response, id: body.id };
+            console.log(`[${new Date().toISOString()}] Cache hit for ${body.method}`);
+          } else {
+            // Clean old cache entries periodically
+            if (requestCache.size > 1000) {
+              cleanCache();
+            }
+            
+            // Get next RPC URL and proxy request
+            const rpcUrl = getNextRpcUrlSimple();
+            console.log(`[${new Date().toISOString()}] Proxying ${body.method} to ${rpcUrl}`);
+            response = await proxyRequest(body, rpcUrl);
+            
+            // Cache successful responses
+            if (!response.error && ENABLE_CACHE) {
+              requestCache.set(cacheKey, {
+                response,
+                timestamp: Date.now()
+              });
+            }
+          }
+        } else {
+          // Get next RPC URL and proxy request
+          const rpcUrl = getNextRpcUrlSimple();
+          console.log(`[${new Date().toISOString()}] Proxying ${body.method} to ${rpcUrl}`);
+          response = await proxyRequest(body, rpcUrl);
+        }
+        
+        // Update statistics
+        if (response.error) {
+          stats.failedRequests++;
+          stats.lastError = response.error.message;
+        } else {
+          stats.successfulRequests++;
+        }
+        
+        const headers = new Headers(corsHeaders);
+        headers.set("Content-Type", "application/json");
+        
+        return new Response(JSON.stringify(response), {
+          headers
+        });
+        
+      } catch (error) {
+        stats.failedRequests++;
+        const errorMessage = error instanceof Error ? error.message : "Unknown error";
+        stats.lastError = errorMessage;
+        console.error("[ERROR] Request processing failed:", errorMessage);
+        
+        const headers = new Headers(corsHeaders);
+        headers.set("Content-Type", "application/json");
+        
+        return new Response(JSON.stringify({
+          jsonrpc: "2.0",
+          error: {
+            code: -32700,
+            message: "Parse error"
+          },
+          id: null
+        }), {
+          status: 400,
+          headers
+        });
+      }
+    }
+    
+    // Only allow POST to /rpc
+    if (url.pathname === "/rpc") {
+      const headers = new Headers(corsHeaders);
+      headers.set("Content-Type", "application/json");
+      
+      return new Response(JSON.stringify({
+        jsonrpc: "2.0",
+        error: {
+          code: -32601,
+          message: "Method not allowed"
+        },
+        id: null
+      }), {
+        status: 405,
+        headers
+      });
+    }
+    
+    // Default 404 response
+    return new Response("Not Found", { 
+      status: 404,
+      headers: corsHeaders
+    });
+  },
+});
+
+console.log(`🚀 Web3 RPC Proxy Server running on http://localhost:${PORT}`);
+console.log(`📡 Configured with ${RPC_URLS.length} RPC endpoints`);
+console.log(`🔄 Using intelligent round-robin with health tracking`);
+console.log(`🔒 CORS enabled for origins: ${CORS_ORIGINS.join(", ")}`);
+console.log(`📏 Max request size: ${(MAX_REQUEST_SIZE / 1024 / 1024).toFixed(2)}MB`);
+console.log(`⏱️  Request timeout: ${REQUEST_TIMEOUT / 1000}s`);
+console.log(`🔀 Max concurrent requests per endpoint: ${MAX_CONCURRENT_REQUESTS}`);
+console.log(`💾 Response caching: ${ENABLE_CACHE ? `Enabled (TTL: ${CACHE_TTL}ms)` : 'Disabled'}`);
+console.log(`\n📊 Health check available at: http://localhost:${PORT}/health`);
+console.log(`🌐 RPC endpoint: http://localhost:${PORT}/rpc`);
+
+// Periodic endpoint health check (every 30 seconds)
+setInterval(() => {
+  const unhealthyEndpoints = Array.from(endpointHealth.values()).filter(h => !h.isHealthy);
+  if (unhealthyEndpoints.length > 0) {
+    console.log(`\n⚠️  ${unhealthyEndpoints.length} unhealthy endpoints detected`);
+    unhealthyEndpoints.forEach(endpoint => {
+      const timeSinceFailure = endpoint.lastFailure ? 
+        Math.round((Date.now() - endpoint.lastFailure.getTime()) / 1000) : 0;
+      console.log(`  - ${endpoint.url}: ${endpoint.consecutiveFailures} failures, last ${timeSinceFailure}s ago`);
+    });
+  }
+}, 30000);
+
+// Graceful shutdown
+process.on("SIGINT", () => {
+  console.log("\n👋 Shutting down server...");
+  server.stop();
+  process.exit(0);
+});
