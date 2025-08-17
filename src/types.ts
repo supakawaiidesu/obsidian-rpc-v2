@@ -30,6 +30,9 @@ export interface RequestStats {
   successfulRequests: number;
   failedRequests: number;
   lastError?: string;
+  lastRpcError?: string;
   uptime: number;
   requestsPerSecond: number;
+  rpcErrors: number;
+  proxyErrors: number;
 }

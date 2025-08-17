@@ -25,18 +25,95 @@ const MAX_RETRY_ATTEMPTS = parseInt(process.env.MAX_RETRY_ATTEMPTS || "2"); // M
 let currentIndex = 0;
 const startTime = Date.now();
 
-// Request statistics
+// Request statistics with proper initialization
 const stats: RequestStats = {
   totalRequests: 0,
   successfulRequests: 0,
   failedRequests: 0,
   uptime: 0,
-  requestsPerSecond: 0
-};
+  requestsPerSecond: 0,
+  rpcErrors: 0,  // Normal RPC errors (like insufficient gas)
+  proxyErrors: 0  // Real proxy/endpoint failures
+} as RequestStats;
 
 // Request tracking for RPS calculation
 let requestCounts: number[] = [];
 let lastSecond = Math.floor(Date.now() / 1000);
+
+// Error classification patterns
+const ENDPOINT_FAILURE_PATTERNS = [
+  // Rate limiting patterns
+  /rate.?limit/i,
+  /too many requests/i,
+  /request.?limit.?exceeded/i,
+  /throttl/i,
+  /429/,
+  
+  // Resource/credit patterns
+  /RU credits/i,
+  /compute.?units/i,
+  /quota.?exceeded/i,
+  /insufficient.?credits/i,
+  
+  // Connection/network errors
+  /ECONNREFUSED/i,
+  /ETIMEDOUT/i,
+  /ENOTFOUND/i,
+  /socket hang up/i,
+  /network error/i,
+  /connection.?(refused|reset|closed)/i,
+  /timeout/i,
+  
+  // Service unavailable
+  /service.?unavailable/i,
+  /503/,
+  /502/,
+  /gateway/i,
+  
+  // Internal/server errors
+  /internal.?server.?error/i,
+  /500/
+];
+
+// Common RPC errors that are NOT endpoint failures
+const NORMAL_RPC_ERROR_PATTERNS = [
+  /intrinsic gas/i,
+  /insufficient.?funds/i,
+  /nonce too (low|high)/i,
+  /transaction.?underpriced/i,
+  /invalid.?argument/i,
+  /execution.?reverted/i,
+  /contract.?call.?exception/i,
+  /invalid.?signature/i,
+  /gas.?limit/i,
+  /already known/i,
+  /replacement.?transaction/i
+];
+
+// Function to classify error type
+function isEndpointFailure(error: any): boolean {
+  if (!error) return false;
+  
+  const errorStr = typeof error === 'string' ? error : 
+                   error.message || error.data || JSON.stringify(error);
+  
+  // First check if it's a known normal RPC error
+  for (const pattern of NORMAL_RPC_ERROR_PATTERNS) {
+    if (pattern.test(errorStr)) {
+      return false; // It's a normal RPC error, not an endpoint failure
+    }
+  }
+  
+  // Then check if it matches endpoint failure patterns
+  for (const pattern of ENDPOINT_FAILURE_PATTERNS) {
+    if (pattern.test(errorStr)) {
+      return true; // It's an endpoint failure
+    }
+  }
+  
+  // Default: treat unknown errors as normal RPC errors
+  return false;
+}
 
 // Endpoint health tracking
 interface EndpointHealth {
@@ -287,9 +364,18 @@ async function proxyRequest(request: JSONRPCRequest, rpcUrl: string): Promise<JS
 
     const data = await response.json() as JSONRPCResponse;
     
-    // Update health metrics on success
-    const responseTime = Date.now() - startTime;
-    updateEndpointHealth(rpcUrl, true, responseTime);
+    // Check if response contains an RPC error that indicates endpoint failure
+    if (data.error && isEndpointFailure(data.error)) {
+      // This is an endpoint failure (rate limit, credits, etc.)
+      updateEndpointHealth(rpcUrl, false);
+      if (DEBUG) {
+        console.error(`[ENDPOINT FAILURE] ${rpcUrl}: ${data.error.message || JSON.stringify(data.error)}`);
+      }
+    } else {
+      // Success or normal RPC error
+      const responseTime = Date.now() - startTime;
+      updateEndpointHealth(rpcUrl, true, responseTime);
+    }
     
     return data;
   } catch (error) {
@@ -356,7 +442,13 @@ const server = serve({
       
       return new Response(JSON.stringify({
         status: healthyEndpoints > 0 ? "healthy" : "degraded",
-        stats,
+        stats: {
+          ...stats,
+          successRate: stats.totalRequests > 0 ? 
+            ((stats.successfulRequests / stats.totalRequests) * 100).toFixed(2) + '%' : '0%',
+          proxyFailureRate: stats.totalRequests > 0 ? 
+            (((stats.proxyErrors || 0) / stats.totalRequests) * 100).toFixed(2) + '%' : '0%'
+        },
         rpcUrls: RPC_URLS.length,
         healthyEndpoints,
         totalActiveRequests,
@@ -455,10 +547,19 @@ const server = serve({
           response = await proxyRequestWithRetry(body);
         }
         
-        // Update statistics
+        // Update statistics based on error classification
         if (response.error) {
-          stats.failedRequests++;
-          stats.lastError = response.error.message;
+          if (isEndpointFailure(response.error)) {
+            // This is a real proxy/endpoint failure
+            stats.failedRequests++;
+            stats.proxyErrors = (stats.proxyErrors || 0) + 1;
+            stats.lastError = `[PROXY] ${response.error.message || JSON.stringify(response.error)}`;
+          } else {
+            // Normal RPC error (like insufficient gas)
+            stats.rpcErrors = (stats.rpcErrors || 0) + 1;
+            stats.successfulRequests++; // Count as successful proxy operation
+            stats.lastRpcError = response.error.message || JSON.stringify(response.error);
+          }
         } else {
           stats.successfulRequests++;
         }
@@ -534,16 +635,61 @@ if (DEBUG) {
 console.log(`\n📊 Health check available at: http://localhost:${PORT}/health`);
 console.log(`🌐 RPC endpoint: http://localhost:${PORT}/rpc`);
 
-// Periodic endpoint health check (every 30 seconds)
-setInterval(() => {
+// Periodic health check and recovery (every 30 seconds)
+setInterval(async () => {
   const unhealthyEndpoints = Array.from(endpointHealth.values()).filter(h => !h.isHealthy);
+  
   if (unhealthyEndpoints.length > 0) {
     console.log(`\n⚠️  ${unhealthyEndpoints.length} unhealthy endpoints detected`);
-    unhealthyEndpoints.forEach(endpoint => {
+    
+    // Try to recover unhealthy endpoints
+    for (const endpoint of unhealthyEndpoints) {
       const timeSinceFailure = endpoint.lastFailure ? 
         Math.round((Date.now() - endpoint.lastFailure.getTime()) / 1000) : 0;
-      console.log(`  - ${endpoint.url}: ${endpoint.consecutiveFailures} failures, last ${timeSinceFailure}s ago`);
-    });
+      
+      // If it's been more than 60 seconds since last failure, try a health check
+      if (timeSinceFailure > 60) {
+        try {
+          console.log(`  🔄 Attempting recovery for ${endpoint.url}...`);
+          
+          // Simple health check - try eth_blockNumber
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 5000);
+          
+          const response = await fetch(endpoint.url, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              method: "eth_blockNumber",
+              params: [],
+              id: 1
+            }),
+            signal: controller.signal
+          });
+          
+          clearTimeout(timeoutId);
+          
+          if (response.ok) {
+            const data = await response.json();
+            if (!data.error || !isEndpointFailure(data.error)) {
+              // Recovery successful!
+              endpoint.isHealthy = true;
+              endpoint.consecutiveFailures = 0;
+              console.log(`  ✅ Recovered: ${endpoint.url}`);
+            } else {
+              console.log(`  ❌ Recovery failed: ${endpoint.url} - Still returning errors`);
+            }
+          }
+        } catch (error) {
+          console.log(`  ❌ Recovery failed: ${endpoint.url} - ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+      } else {
+        console.log(`  - ${endpoint.url}: ${endpoint.consecutiveFailures} failures, last ${timeSinceFailure}s ago`);
+      }
+    }
   }
 }, 30000);
 

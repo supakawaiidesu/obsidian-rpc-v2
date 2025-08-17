@@ -11,9 +11,9 @@
     "test": "bun test",
     "stress-test": "bun run stress-test.ts"
   },
-  "dependencies": {},
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "typescript": "^5.9.2"
   },
   "author": "",
   "license": "MIT"
