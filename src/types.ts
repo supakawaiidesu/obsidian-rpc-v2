@@ -2,14 +2,14 @@ export interface JSONRPCRequest {
   jsonrpc: string;
   method: string;
   params?: any[];
-  id: number | string;
+  id: number | string | null;
 }
 
 export interface JSONRPCResponse {
   jsonrpc: string;
   result?: any;
   error?: JSONRPCError;
-  id: number | string;
+  id: number | string | null;
 }
 
 export interface JSONRPCError {

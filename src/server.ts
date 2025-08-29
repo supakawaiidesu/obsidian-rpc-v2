@@ -11,6 +11,10 @@ const RPC_URLS = process.env.RPC_URLS?.split(",") || [
   //"https://arbitrum-one-public.nodies.app",
 ];
 
+// Arbitrum chain configuration
+const ARBITRUM_CHAIN_ID = 42161;
+const ARBITRUM_CHAIN_ID_HEX = "0xa4b1";
+
 // CORS configuration
 const CORS_ORIGINS = process.env.CORS_ORIGINS?.split(",") || ["*"];
 const MAX_REQUEST_SIZE = parseInt(process.env.MAX_REQUEST_SIZE || "1048576"); // 1MB default
@@ -19,6 +23,7 @@ const MAX_CONCURRENT_REQUESTS = parseInt(process.env.MAX_CONCURRENT_REQUESTS || 
 const ENABLE_CACHE = process.env.ENABLE_CACHE === "true";
 const CACHE_TTL = parseInt(process.env.CACHE_TTL || "1000"); // 1 second cache for identical requests
 const DEBUG = process.env.DEBUG === "true"; // Debug mode for verbose logging
+const VERBOSE_LOGGING = process.env.VERBOSE_LOGGING !== "false"; // Detailed request/response logging (default: true for dev)
 const MAX_RETRY_ATTEMPTS = parseInt(process.env.MAX_RETRY_ATTEMPTS || "2"); // Max additional RPC attempts on failure
 
 // Atomic counter for round-robin rotation
@@ -293,8 +298,100 @@ function updateRPS() {
   stats.requestsPerSecond = totalRequests / Math.max(1, requestCounts.length);
 }
 
+// Normalize response field order to always be jsonrpc, id, then result/error
+function normalizeResponseFieldOrder(response: JSONRPCResponse): JSONRPCResponse {
+  const normalized: any = {
+    jsonrpc: response.jsonrpc || "2.0"
+  };
+  
+  // id comes second
+  normalized.id = response.id !== undefined ? response.id : null;
+  
+  // result or error comes third
+  if (response.error) {
+    normalized.error = response.error;
+  } else if (response.result !== undefined) {
+    normalized.result = response.result;
+  }
+  
+  return normalized;
+}
+
+// Helper function for detailed logging
+function logRequest(request: JSONRPCRequest, source: string = "CLIENT") {
+  if (!VERBOSE_LOGGING) return;
+  
+  const timestamp = new Date().toISOString();
+  console.log(`\n${"=".repeat(80)}`);
+  console.log(`[${timestamp}] INCOMING REQUEST from ${source}`);
+  console.log(`Method: ${request.method}`);
+  console.log(`ID: ${request.id}`);
+  if (request.params) {
+    console.log(`Params: ${JSON.stringify(request.params, null, 2)}`);
+  } else {
+    console.log(`Params: none`);
+  }
+  console.log(`${"=".repeat(80)}`);
+}
+
+function logResponse(response: JSONRPCResponse, duration: number, source: string = "PROXY") {
+  if (!VERBOSE_LOGGING) return;
+  
+  const timestamp = new Date().toISOString();
+  console.log(`\n[${timestamp}] RESPONSE from ${source} (${duration}ms)`);
+  console.log(`ID: ${response.id}`);
+  
+  if (response.error) {
+    console.log(`ERROR Code: ${response.error.code}`);
+    console.log(`ERROR Message: ${response.error.message}`);
+    if (response.error.data) {
+      console.log(`ERROR Data: ${JSON.stringify(response.error.data, null, 2)}`);
+    }
+  } else if (response.result !== undefined) {
+    // Truncate long results for readability
+    const resultStr = JSON.stringify(response.result);
+    if (resultStr.length > 500) {
+      console.log(`Result (truncated): ${resultStr.substring(0, 500)}...`);
+    } else {
+      console.log(`Result: ${resultStr}`);
+    }
+  }
+  console.log(`${"=".repeat(80)}\n`);
+}
+
+// Handle local network detection methods
+function handleLocalMethod(request: JSONRPCRequest): JSONRPCResponse | null {
+  switch (request.method) {
+    case "eth_chainId":
+      const chainIdResponse = {
+        jsonrpc: "2.0",
+        id: request.id || null,
+        result: ARBITRUM_CHAIN_ID_HEX
+      };
+      if (VERBOSE_LOGGING) console.log(`[LOCAL HANDLER] Returning eth_chainId: ${ARBITRUM_CHAIN_ID_HEX}`);
+      return chainIdResponse;
+    
+    case "net_version":
+      const netVersionResponse = {
+        jsonrpc: "2.0",
+        id: request.id || null,
+        result: ARBITRUM_CHAIN_ID.toString()
+      };
+      if (VERBOSE_LOGGING) console.log(`[LOCAL HANDLER] Returning net_version: ${ARBITRUM_CHAIN_ID}`);
+      return netVersionResponse;
+    
+    default:
+      return null;
+  }
+}
+
 // Proxy request with retry logic
 async function proxyRequestWithRetry(request: JSONRPCRequest): Promise<JSONRPCResponse> {
+  // Check if we can handle this locally
+  const localResponse = handleLocalMethod(request);
+  if (localResponse) {
+    return localResponse;
+  }
   const primaryUrl = getNextRpcUrlSimple();
   let lastError: JSONRPCResponse | null = null;
   
@@ -334,6 +431,8 @@ async function proxyRequestWithRetry(request: JSONRPCRequest): Promise<JSONRPCRe
 async function proxyRequest(request: JSONRPCRequest, rpcUrl: string): Promise<JSONRPCResponse> {
   const startTime = Date.now();
   const health = endpointHealth.get(rpcUrl);
+  
+  if (VERBOSE_LOGGING) console.log(`[PROXYING] Forwarding ${request.method} to ${rpcUrl}`);
   
   if (health) {
     health.activeRequests++;
@@ -377,25 +476,24 @@ async function proxyRequest(request: JSONRPCRequest, rpcUrl: string): Promise<JS
       updateEndpointHealth(rpcUrl, true, responseTime);
     }
     
-    return data;
+    // Normalize field order before returning
+    return normalizeResponseFieldOrder(data);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
     const isTimeout = error instanceof Error && error.name === "AbortError";
-    if (DEBUG || isTimeout) {
-      console.error(`[ERROR] RPC request failed for ${rpcUrl}:`, errorMessage);
-    }
+    console.error(`[PROXY ERROR] Request to ${rpcUrl} failed:`, errorMessage);
     
     // Update health metrics on failure
     updateEndpointHealth(rpcUrl, false);
     
     return {
       jsonrpc: "2.0",
+      id: request.id || null,
       error: {
         code: isTimeout ? -32050 : -32603,
         message: isTimeout ? "Request timeout" : "Internal error",
         data: errorMessage
-      },
-      id: request.id
+      }
     };
   } finally {
     if (health) {
@@ -484,47 +582,211 @@ const server = serve({
           
           return new Response(JSON.stringify({
             jsonrpc: "2.0",
+            id: null,
             error: {
               code: -32700,
               message: "Request too large"
-            },
-            id: null
+            }
           }), {
             status: 413,
             headers
           });
         }
         
-        const body = await req.json() as JSONRPCRequest;
+        // Handle empty body or parse errors
+        let body: JSONRPCRequest | JSONRPCRequest[];
+        let isBatch = false;
         
-        // Validate JSON-RPC request
-        if (!body.jsonrpc || !body.method) {
+        try {
+          const text = await req.text();
+          
+          // Check for empty body
+          if (!text || text.trim() === '' || text === 'null' || text === 'undefined') {
+            stats.failedRequests++;
+            const headers = new Headers(corsHeaders);
+            headers.set("Content-Type", "application/json");
+            
+            const errorResponse = {
+              jsonrpc: "2.0",
+              id: null,
+              error: {
+                code: -32700,
+                message: "Parse error"
+              }
+            };
+            
+            console.log(`[PARSE ERROR] Empty or invalid request body: "${text}"`);
+            logResponse(errorResponse, 0, "PARSE_ERROR");
+            
+            return new Response(JSON.stringify(errorResponse), {
+              status: 400,
+              headers
+            });
+          }
+          
+          const parsed = JSON.parse(text);
+          
+          // Check if it's a batch request (array)
+          if (Array.isArray(parsed)) {
+            isBatch = true;
+            body = parsed as JSONRPCRequest[];
+            console.log(`[BATCH REQUEST] Received batch of ${body.length} requests`);
+          } else {
+            body = parsed as JSONRPCRequest;
+          }
+          
+          // Check if parsed body is null or undefined
+          if (!body || typeof body !== 'object') {
+            stats.failedRequests++;
+            const headers = new Headers(corsHeaders);
+            headers.set("Content-Type", "application/json");
+            
+            const errorResponse = {
+              jsonrpc: "2.0",
+              id: null,
+              error: {
+                code: -32700,
+                message: "Parse error"
+              }
+            };
+            
+            console.log(`[PARSE ERROR] Body is null or not an object`);
+            logResponse(errorResponse, 0, "PARSE_ERROR");
+            
+            return new Response(JSON.stringify(errorResponse), {
+              status: 400,
+              headers
+            });
+          }
+        } catch (jsonError) {
+          // JSON parsing failed
           stats.failedRequests++;
           const headers = new Headers(corsHeaders);
           headers.set("Content-Type", "application/json");
           
-          return new Response(JSON.stringify({
+          const errorResponse = {
             jsonrpc: "2.0",
+            id: null,
             error: {
-              code: -32600,
-              message: "Invalid Request"
-            },
-            id: body.id || null
-          }), {
+              code: -32700,
+              message: "Parse error"
+            }
+          };
+          
+          console.log(`[PARSE ERROR] JSON parsing failed:`, jsonError);
+          logResponse(errorResponse, 0, "PARSE_ERROR");
+          
+          return new Response(JSON.stringify(errorResponse), {
             status: 400,
             headers
           });
         }
         
+        // Handle batch requests
+        if (isBatch) {
+          const batchResponses: JSONRPCResponse[] = [];
+          const requestStartTime = Date.now();
+          
+          for (const request of body as JSONRPCRequest[]) {
+            if (VERBOSE_LOGGING) {
+              logRequest(request);
+            }
+            
+            // Validate each request in the batch
+            if (!request.jsonrpc || !request.method) {
+              batchResponses.push({
+                jsonrpc: "2.0",
+                id: request.id || null,
+                error: {
+                  code: -32600,
+                  message: "Invalid Request"
+                }
+              });
+              continue;
+            }
+            
+            // Process each request
+            const response = await proxyRequestWithRetry(request);
+            batchResponses.push(response);
+            
+            if (VERBOSE_LOGGING) {
+              const duration = Date.now() - requestStartTime;
+              logResponse(response, duration, response.error ? "ERROR" : "SUCCESS");
+            }
+          }
+          
+          const headers = new Headers(corsHeaders);
+          headers.set("Content-Type", "application/json");
+          
+          console.log(`[BATCH COMPLETE] Processed ${batchResponses.length} requests in ${Date.now() - requestStartTime}ms`);
+          
+          return new Response(JSON.stringify(batchResponses), {
+            headers
+          });
+        }
+        
+        // Single request handling
+        const singleBody = body as JSONRPCRequest;
+        
+        // Handle ethers.js v6 empty object probe (it sends {} during network detection)
+        if (Object.keys(singleBody).length === 0) {
+          // Ethers.js v6 sends an empty object to probe the endpoint
+          // Respond with a valid eth_chainId response to help it detect the network
+          const probeResponse = {
+            jsonrpc: "2.0",
+            id: 1,
+            result: ARBITRUM_CHAIN_ID_HEX
+          };
+          
+          console.log(`[ETHERS PROBE] Detected ethers.js v6 network probe (empty object), returning eth_chainId`);
+          const headers = new Headers(corsHeaders);
+          headers.set("Content-Type", "application/json");
+          
+          return new Response(JSON.stringify(probeResponse), {
+            headers
+          });
+        }
+        
+        // Validate JSON-RPC request
+        if (!singleBody.jsonrpc || !singleBody.method) {
+          stats.failedRequests++;
+          const headers = new Headers(corsHeaders);
+          headers.set("Content-Type", "application/json");
+          
+          const errorResponse = {
+            jsonrpc: "2.0",
+            id: singleBody.id || null,
+            error: {
+              code: -32600,
+              message: "Invalid Request"
+            }
+          };
+          
+          console.log(`\n[VALIDATION ERROR] Invalid request - missing jsonrpc or method`);
+          console.log(`Request body was:`, JSON.stringify(singleBody));
+          logResponse(errorResponse, 0, "VALIDATION");
+          
+          return new Response(JSON.stringify(errorResponse), {
+            status: 400,
+            headers
+          });
+        }
+        
+        // Log the incoming request
+        const requestStartTime = Date.now();
+        logRequest(singleBody);
+        
         // Check cache if enabled
         let response: JSONRPCResponse;
-        const cacheKey = getCacheKey(body);
+        const cacheKey = getCacheKey(singleBody);
         
         if (ENABLE_CACHE) {
           const cached = requestCache.get(cacheKey);
           if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-            response = { ...cached.response, id: body.id };
-            if (DEBUG) console.log(`[${new Date().toISOString()}] Cache hit for ${body.method}`);
+            response = { ...cached.response, id: singleBody.id };
+            if (VERBOSE_LOGGING) console.log(`[CACHE HIT] Returning cached response for ${singleBody.method}`);
+            const duration = Date.now() - requestStartTime;
+            logResponse(response, duration, "CACHE");
           } else {
             // Clean old cache entries periodically
             if (requestCache.size > 1000) {
@@ -532,7 +794,7 @@ const server = serve({
             }
             
             // Proxy request with retry logic
-            response = await proxyRequestWithRetry(body);
+            response = await proxyRequestWithRetry(singleBody);
             
             // Cache successful responses
             if (!response.error && ENABLE_CACHE) {
@@ -544,8 +806,12 @@ const server = serve({
           }
         } else {
           // Proxy request with retry logic
-          response = await proxyRequestWithRetry(body);
+          response = await proxyRequestWithRetry(singleBody);
         }
+        
+        // Log the response
+        const duration = Date.now() - requestStartTime;
+        logResponse(response, duration, response.error ? "ERROR" : "SUCCESS");
         
         // Update statistics based on error classification
         if (response.error) {
@@ -575,19 +841,23 @@ const server = serve({
         stats.failedRequests++;
         const errorMessage = error instanceof Error ? error.message : "Unknown error";
         stats.lastError = errorMessage;
-        if (DEBUG) console.error("[ERROR] Request processing failed:", errorMessage);
+        console.error("[REQUEST PROCESSING ERROR]:", errorMessage);
         
         const headers = new Headers(corsHeaders);
         headers.set("Content-Type", "application/json");
         
-        return new Response(JSON.stringify({
+        const errorResponse = {
           jsonrpc: "2.0",
+          id: null,
           error: {
             code: -32700,
             message: "Parse error"
-          },
-          id: null
-        }), {
+          }
+        };
+        
+        logResponse(errorResponse, 0, "PARSE_ERROR");
+        
+        return new Response(JSON.stringify(errorResponse), {
           status: 400,
           headers
         });
@@ -601,11 +871,11 @@ const server = serve({
       
       return new Response(JSON.stringify({
         jsonrpc: "2.0",
+        id: null,
         error: {
           code: -32601,
           message: "Method not allowed"
-        },
-        id: null
+        }
       }), {
         status: 405,
         headers
@@ -625,6 +895,7 @@ console.log(`📡 Configured with ${RPC_URLS.length} RPC endpoints`);
 console.log(`🔄 Using intelligent round-robin with health tracking`);
 console.log(`🔁 Retry on failure: ${MAX_RETRY_ATTEMPTS > 0 ? `Enabled (max ${MAX_RETRY_ATTEMPTS} retries)` : 'Disabled'}`);
 console.log(`🐛 Debug mode: ${DEBUG ? 'Enabled' : 'Disabled'}`);
+console.log(`📝 Verbose logging: ${VERBOSE_LOGGING ? 'Enabled (showing all requests/responses)' : 'Disabled'}`);
 if (DEBUG) {
   console.log(`🔒 CORS enabled for origins: ${CORS_ORIGINS.join(", ")}`);
   console.log(`📏 Max request size: ${(MAX_REQUEST_SIZE / 1024 / 1024).toFixed(2)}MB`);
